@@ -1,23 +1,33 @@
 # itchio_charity_bundles_feed.py
 # Builds an RSS feed (feed.xml) of likely charity bundle/jam opportunities on itch.io.
 # Sources:
-#   - Blog index (filters by charity keywords)                      -> [BLOG]
-#   - Game Jams board (follows thread pages 1 click deep)           -> [BOARD]
-#   - Jams "Starting This Month" (+ Starting Soon; follows pages)   -> [JAMS]
+#   - Blog index (charity keywords; date-gated)                    -> [BLOG]
+#   - Game Jams board (follows thread pages 1 click deep; date)    -> [BOARD]
+#   - Jams "Starting This Month" (+ Starting Soon; follows pages)  -> [JAMS]
+#       NEW: Paginates ?page=2,3,... (configurable) and de-dupes across sorts.
 #
-# NOTE: SUBMISSION keyword requirement removed — now only charity keywords are required.
+# Charity-only matching (no "submit" keyword required).
+# Fresh-only filter for BLOG/BOARD items and date-aware pubDate.
 
 import re, json, time, hashlib, datetime as dt
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
 import requests
 from bs4 import BeautifulSoup as BS
 from xml.etree.ElementTree import Element, SubElement, ElementTree
 
-USER_AGENT = "itchio-charity-watcher/1.5"
+USER_AGENT = "itchio-charity-watcher/1.7"
 OUT_FEED = Path("feed.xml")
 STATE = Path(".seen.json")
+
+# --- Settings ----------------------------------------------------------------
+# Non-jam (blog/threads) freshness window:
+MAX_AGE_DAYS = 30
+# How many pages of "starting this month" to crawl per base URL:
+MAX_JAMS_PAGES = 5          # try 5 first; increase if you want deeper crawl
+MAX_JAMS_PER_PAGE = 60      # safety cap per page
+MAX_JAMS_TOTAL = 200        # overall safety cap per run across both lists
 
 # --- Keyword filters (charity only) ------------------------------------------
 CHARITY = re.compile(
@@ -28,10 +38,13 @@ CHARITY = re.compile(
 # --- Sources -----------------------------------------------------------------
 SOURCES = [
     ("https://itch.io/blog", "[BLOG]"),
-    ("https://itch.io/board/533649/game-jams", "[BOARD]"),              # Game Jams board (current URL)
-    ("https://itch.io/jams/starting-this-month", "[JAMS]"),             # Jams starting this month
-    ("https://itch.io/jams/starting-this-month/sort-date", "[JAMS]"),   # "Starting Soon" sort
+    ("https://itch.io/board/533649/game-jams", "[BOARD]"),                    # Game Jams board
+    ("https://itch.io/jams/starting-this-month", "[JAMS]"),                   # Month view
+    ("https://itch.io/jams/starting-this-month/sort-date", "[JAMS]"),         # "Starting Soon" sort
 ]
+
+# Global de-dupe for jam links across both month views
+JAMS_SEEN_LINKS = set()
 
 # --- HTTP helpers -------------------------------------------------------------
 def get(url: str) -> str:
@@ -48,6 +61,41 @@ def to_abs(href: str) -> str:
         return "https://itch.io" + href
     return urljoin("https://itch.io/", href)
 
+# --- Time helpers -------------------------------------------------------------
+def parse_iso_any(ts: str):
+    try:
+        if ts.endswith("Z"):
+            ts = ts[:-1] + "+00:00"
+        return dt.datetime.fromisoformat(ts)
+    except Exception:
+        return None
+
+def find_page_timestamp(soup: BS):
+    """Try to find a meaningful published/updated time on blog/thread pages."""
+    for t in soup.select("time[datetime]"):
+        d = parse_iso_any(t.get("datetime", "").strip())
+        if d:
+            return d if d.tzinfo else d.replace(tzinfo=dt.timezone.utc)
+    for sel in [
+        "meta[property='article:published_time']",
+        "meta[name='date']",
+        "meta[name='pubdate']",
+        "meta[itemprop='datePublished']",
+        "meta[itemprop='dateModified']",
+    ]:
+        m = soup.select_one(sel)
+        if m and m.get("content"):
+            d = parse_iso_any(m["content"].strip())
+            if d:
+                return d if d.tzinfo else d.replace(tzinfo=dt.timezone.utc)
+    return None
+
+def within_age(ts, days: int = MAX_AGE_DAYS) -> bool:
+    if ts is None:
+        return False
+    now = dt.datetime.now(dt.timezone.utc)
+    return ts >= now - dt.timedelta(days=days)
+
 # --- Jam listing parsing (exclude 'Ended …' AND follow jam pages) ------------
 JAM_STATUS_HINT = re.compile(r"(Starts in|Submission closes in|Ended)", re.I)
 
@@ -62,8 +110,8 @@ def parse_iso(ts: str):
 def extract_text(elem) -> str:
     return " ".join((elem.get_text(" ") if elem else "").split())
 
-def jam_page_matches(full_html: str) -> tuple[bool, str]:
-    """Check full jam page for charity keywords; return (match, summary_text)."""
+def jam_page_matches(full_html: str):
+    """Check full jam page for charity keywords; return (match, summary_text, soup)."""
     soup = BS(full_html, "html.parser")
     chunks = []
     for sel in [
@@ -75,73 +123,107 @@ def jam_page_matches(full_html: str) -> tuple[bool, str]:
     if not chunks:
         chunks.append(extract_text(soup.body))
     text = " ".join(chunks)
-    match = bool(CHARITY.search(text))  # <-- only charity terms required
-    return match, text[:280]
+    match = bool(CHARITY.search(text))
+    return match, text[:280], soup
 
-def items_from_jams_listing(url: str, html: str, label: str, max_jams: int = 30):
-    """From a 'starting this month' listing, collect jam cards, drop 'Ended',
-    then follow each jam page and apply full-body charity keyword checks."""
-    soup = BS(html, "html.parser")
-    out = []
+def set_page(url: str, page_num: int) -> str:
+    """Return url with ?page=page_num (preserving existing query)."""
+    pr = urlparse(url)
+    q = parse_qs(pr.query)
+    q["page"] = [str(page_num)]
+    new_q = urlencode(q, doseq=True)
+    return urlunparse((pr.scheme, pr.netloc, pr.path, pr.params, new_q, pr.fragment))
+
+def collect_jam_links_from_listing(base_url: str, max_pages: int, per_page_cap: int, total_cap: int):
+    """Iterate listing pages, collect unique jam links with basic card filtering."""
     now = dt.datetime.now(dt.timezone.utc)
-
-    # Collect unique jam links
-    seen_links = []
-    for a in soup.select("a[href*='/jam/']"):
-        link = to_abs(a.get("href") or "")
-        if link.startswith("https://itch.io/jam/") and link not in seen_links:
-            seen_links.append(link)
-
-    # Filter cards first (skip clearly ended; prefer future-dated)
-    kept_links = []
-    for link in seen_links:
-        anchor = soup.find("a", href=lambda h: h and (link.endswith(h) or h == link.replace("https://itch.io", "")))
-        container = anchor
-        for _ in range(3):
-            if container and container.parent:
-                container = container.parent
-        text_blob = extract_text(container) if container else (extract_text(anchor) if anchor else "")
-        ended = bool(re.search(r"\bEnded\b", text_blob, re.I))
-        if ended:
+    collected = []
+    for p in range(1, max_pages + 1):
+        if len(collected) >= total_cap:
+            break
+        page_url = base_url if p == 1 and "page=" not in base_url else set_page(base_url, p)
+        try:
+            html = get(page_url)
+        except Exception as e:
+            print("WARN listing:", page_url, e)
             continue
+        soup = BS(html, "html.parser")
 
-        ts_val = None
-        t = container.find("time") if container else None
-        if t and t.has_attr("datetime"):
-            ts_val = parse_iso(t["datetime"])
-            if ts_val and ts_val.tzinfo is None:
-                ts_val = ts_val.replace(tzinfo=dt.timezone.utc)
+        seen_page = 0
+        # Find jam cards via links to /jam/...
+        for a in soup.select("a[href*='/jam/']"):
+            link = to_abs(a.get("href") or "")
+            if not link.startswith("https://itch.io/jam/"):
+                continue
+            if link in JAMS_SEEN_LINKS:
+                continue
 
-        starts_in = bool(re.search(r"\bStarts in\b", text_blob, re.I))
-        closes_in = bool(re.search(r"\bSubmission closes in\b", text_blob, re.I))
+            # Try to find card container and status text
+            anchor = a
+            container = anchor
+            for _ in range(3):
+                if container and container.parent:
+                    container = container.parent
+            text_blob = extract_text(container) if container else (extract_text(anchor) if anchor else "")
+            if re.search(r"\bEnded\b", text_blob, re.I):
+                continue
 
-        if ts_val:
-            if (starts_in or closes_in) and ts_val > now:
-                kept_links.append(link)
-        else:
-            if starts_in or closes_in:
-                kept_links.append(link)
+            # Timestamp from card if any
+            ts_val = None
+            t = container.find("time") if container else None
+            if t and t.has_attr("datetime"):
+                ts_val = parse_iso(t["datetime"])
+                if ts_val and ts_val.tzinfo is None:
+                    ts_val = ts_val.replace(tzinfo=dt.timezone.utc)
 
-        if len(kept_links) >= max_jams:
+            starts_in = bool(re.search(r"\bStarts in\b", text_blob, re.I))
+            closes_in = bool(re.search(r"\bSubmission closes in\b", text_blob, re.I))
+
+            keep = False
+            if ts_val:
+                if (starts_in or closes_in) and ts_val > now:
+                    keep = True
+            else:
+                if starts_in or closes_in:
+                    keep = True
+
+            if not keep:
+                continue
+
+            JAMS_SEEN_LINKS.add(link)
+            collected.append((link, ts_val))
+            seen_page += 1
+            if seen_page >= per_page_cap or len(collected) >= total_cap:
+                break
+
+        # If a page yields nothing, we can stop early
+        if seen_page == 0 and p > 1:
             break
 
-    # Follow jam pages and run charity-only checks
-    for jlink in kept_links:
+        time.sleep(1)  # polite delay between listing pages
+    return collected
+
+def items_from_jams_month(base_url: str, label: str):
+    """Paginate through month listings, then follow each jam page and apply full-body checks."""
+    out = []
+    kept = collect_jam_links_from_listing(
+        base_url, MAX_JAMS_PAGES, MAX_JAMS_PER_PAGE, MAX_JAMS_TOTAL
+    )
+    for jlink, card_ts in kept:
         try:
             jhtml = get(jlink)
-            ok, snippet = jam_page_matches(jhtml)
+            ok, snippet, jsoup = jam_page_matches(jhtml)
             if ok:
-                jsoup = BS(jhtml, "html.parser")
                 title = extract_text(jsoup.select_one("h1, .jam_title, .header_title")) or "Jam"
                 out.append({
                     "title": f"{label} {title}"[:160],
                     "link": jlink,
-                    "summary": snippet
+                    "summary": snippet,
+                    "ts": card_ts or dt.datetime.now(dt.timezone.utc)
                 })
             time.sleep(1)
         except Exception as e:
             print("WARN jam:", jlink, e)
-
     return out
 
 # --- Generic HTML scanning with optional deep-follow for boards ---------------
@@ -151,9 +233,9 @@ def items_from_html(url: str, html: str, label: str):
     soup = BS(html, "html.parser")
     candidates = []
 
-    # Jam listings (starting this month)
+    # Jam listings (starting this month) — now paginated
     if url.startswith("https://itch.io/jams/starting-this-month"):
-        return items_from_jams_listing(url, html, label)
+        return items_from_jams_month(url, label)
 
     # Blog index — prefer real blog post links
     if url.rstrip("/") == "https://itch.io/blog":
@@ -166,12 +248,22 @@ def items_from_html(url: str, html: str, label: str):
             parent = a.find_parent()
             snippet = extract_text(parent)[:500] if parent else ""
             blob = f"{text} — {snippet}"
-            if CHARITY.search(blob):  # <-- charity-only
-                candidates.append({
-                    "title": f"{label} {text}"[:160],
-                    "link": href,
-                    "summary": snippet[:280]
-                })
+            if CHARITY.search(blob):
+                ts = None
+                try:
+                    if href.startswith("https://itch.io/blog/"):
+                        blog_html = get(href)
+                        blog_soup = BS(blog_html, "html.parser")
+                        ts = find_page_timestamp(blog_soup)
+                except Exception:
+                    ts = None
+                if within_age(ts):
+                    candidates.append({
+                        "title": f"{label} {text}"[:160],
+                        "link": href,
+                        "summary": snippet[:280],
+                        "ts": ts
+                    })
         return candidates
 
     # Board listing — follow thread links one click deep
@@ -185,12 +277,13 @@ def items_from_html(url: str, html: str, label: str):
             try:
                 thtml = get(tlink)
                 candidates.extend(items_from_html(tlink, thtml, label))
-                time.sleep(1)
+                time.sleep(1)  # polite
             except Exception as e:
                 print("WARN thread:", tlink, e)
         return candidates
 
-    # Generic page scan (thread pages land here)
+    # Generic page scan (thread pages land here) — charity-only + date-gate
+    page_ts = find_page_timestamp(soup)
     for a in soup.select("a"):
         href = to_abs(a.get("href") or "")
         text = extract_text(a)
@@ -199,11 +292,12 @@ def items_from_html(url: str, html: str, label: str):
         parent = a.find_parent()
         snippet = extract_text(parent)[:500] if parent else ""
         blob = f"{text} — {snippet}"
-        if CHARITY.search(blob):  # <-- charity-only
+        if CHARITY.search(blob) and within_age(page_ts):
             candidates.append({
                 "title": f"{label} {text}"[:160],
                 "link": href,
-                "summary": snippet[:280]
+                "summary": snippet[:280],
+                "ts": page_ts
             })
     return candidates
 
@@ -228,7 +322,7 @@ def build_rss(items):
     channel = SubElement(rss, "channel")
     SubElement(channel, "title").text = "itch.io Charity Bundles — Opportunities"
     SubElement(channel, "link").text = "https://itch.io"
-    SubElement(channel, "description").text = "Auto-collected posts and jams related to charity/fundraisers on itch.io."
+    SubElement(channel, "description").text = "Auto-collected posts and jams related to charity/fundraisers on itch.io (fresh-only)."
     SubElement(channel, "lastBuildDate").text = now.strftime("%a, %d %b %Y %H:%M:%S +0000")
 
     for it in items:
@@ -236,7 +330,8 @@ def build_rss(items):
         SubElement(item, "title").text = it["title"]
         SubElement(item, "link").text = it["link"]
         SubElement(item, "guid").text = hash_item(it)
-        SubElement(item, "pubDate").text = now.strftime("%a, %d %b %Y %H:%M:%S +0000")
+        when = it.get("ts") or now
+        SubElement(item, "pubDate").text = when.strftime("%a, %d %b %Y %H:%M:%S +0000")
         SubElement(item, "description").text = it.get("summary") or it["title"]
 
     ElementTree(rss).write(OUT_FEED, encoding="utf-8", xml_declaration=True)
@@ -258,7 +353,8 @@ def main():
         except Exception as e:
             print("WARN:", url, e)
 
-    combined = found[-50:]  # keep last ~50
+    # Keep the latest ~50
+    combined = found[-50:]
     build_rss(combined)
     save_seen(new_seen)
     print(f"Wrote {len(combined)} items to {OUT_FEED}")
