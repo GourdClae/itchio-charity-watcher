@@ -2,7 +2,6 @@
 # Creates feed.xml with items that look like charity bundle calls for submissions on itch.io.
 # Run locally:  python itchio_charity_bundles_feed.py
 # Outputs: feed.xml (RSS) and .seen.json (state)
-# Schedule with GitHub Actions to auto-update daily.
 
 import re, json, time, hashlib, datetime as dt
 from pathlib import Path
@@ -10,48 +9,52 @@ import requests
 from bs4 import BeautifulSoup as BS
 from xml.etree.ElementTree import Element, SubElement, ElementTree
 
-USER_AGENT = "itchio-charity-watcher/1.0"
+USER_AGENT = "itchio-charity-watcher/1.1"
 OUT_FEED = Path("feed.xml")
 STATE = Path(".seen.json")
 
-# You can tweak these keyword lists as you learn which phrasing organizers use.
-CHARITY = re.compile(r"\\b(charity|fundraiser|donation|relief|mutual aid|non[- ]?profit|benefit)\\b", re.I)
-SUBMIT  = re.compile(r"\\b(accepting submissions|submissions open|submit your game|call for submissions|contributors? wanted|seeking entries|open call)\\b", re.I)
+# Keywords: require one from CHARITY and one from SUBMIT in title or nearby text
+CHARITY = re.compile(r"\b(charity|fundraiser|donation|relief|mutual aid|non[- ]?profit|benefit)\b", re.I)
+SUBMIT  = re.compile(r"\b(accepting submissions|submissions open|submit your game|call for submissions|contributors? wanted|seeking entries|open call)\b", re.I)
 
-# Add or remove sources here. The script is conservative and only keeps items that match both CHARITY and SUBMIT.
+# Real pages to scan (no /blog/search — it doesn't exist)
 SOURCES = [
-    "https://itch.io/blog/search?q=bundle",
-    "https://itch.io/blog/search?q=charity",
-    "https://itch.io/blog/search?q=submissions",
-    "https://itch.io/community",
-    "https://itch.io/blog",
-    # Optional: Bundles directory (filtered hard by keywords):
-    "https://itch.io/bundles",
+    "https://itch.io/blog",      # blog index; we'll target post links under /blog/
+    "https://itch.io/community", # community landing with many bundle/call threads
+    "https://itch.io/bundles",   # bundles directory; filtered by our keywords
 ]
 
-def get(url):
+def get(url: str) -> str:
     r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=30)
     r.raise_for_status()
     return r.text
 
-def items_from_page(url, html):
-    soup = BS(html, "html.parser")
-    candidates = []
+def normalize_abs(href: str) -> str:
+    if not href:
+        return ""
+    if href.startswith("/"):
+        return "https://itch.io" + href
+    return href
 
-    # Collect anchors; use nearby text as a snippet
-    for a in soup.select("a"):
-        href = a.get("href") or ""
+def items_from_page(url: str, html: str):
+    soup = BS(html, "html.parser")
+
+    # Prefer specific anchors on the blog index to avoid nav/footer noise
+    if url.rstrip("/") == "https://itch.io/blog":
+        anchors = soup.select("a[href*='/blog/']") or soup.select("a")
+    else:
+        anchors = soup.select("a")
+
+    candidates = []
+    for a in anchors:
+        href = normalize_abs(a.get("href") or "")
         text = " ".join(a.get_text(" ").split())
         if not href or not text:
             continue
-
-        # Absolute URL
-        if href.startswith("/"):
-            href = "https://itch.io" + href
         if not href.startswith("https://itch.io"):
             continue
 
-        # Neighborhood snippet
+        # Pull nearby text as a snippet for keyword matching
         snippet = ""
         parent = a.find_parent()
         if parent:
@@ -66,7 +69,7 @@ def items_from_page(url, html):
             })
     return candidates
 
-def hash_item(it):
+def hash_item(it) -> str:
     return hashlib.sha1((it["title"] + it["link"]).encode("utf-8")).hexdigest()
 
 def load_seen():
@@ -81,7 +84,8 @@ def save_seen(ids):
     STATE.write_text(json.dumps(sorted(ids)))
 
 def build_rss(items):
-    now = dt.datetime.utcnow()
+    # Use timezone-aware UTC to avoid deprecation warnings
+    now = dt.datetime.now(dt.timezone.utc)
     rss = Element("rss", version="2.0")
     channel = SubElement(rss, "channel")
     SubElement(channel, "title").text = "itch.io Charity Bundles — Calls for Submissions"
@@ -112,11 +116,11 @@ def main():
                 if it["id"] not in seen:
                     found.append(it)
                 new_seen.add(it["id"])
-            time.sleep(1)
+            time.sleep(1)  # be polite
         except Exception as e:
             print("WARN:", url, e)
 
-    # Keep last ~50
+    # Keep the latest ~50 items (new first)
     combined = found[-50:]
     build_rss(combined)
     save_seen(new_seen)
