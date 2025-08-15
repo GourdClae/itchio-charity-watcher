@@ -3,8 +3,9 @@
 # Sources:
 #   - Blog index (charity keywords; date-gated)                    -> [BLOG]
 #   - Game Jams board (follows thread pages 1 click deep; date)    -> [BOARD]
-#   - Jams "Starting This Month" (+ Starting Soon; follows pages)  -> [JAMS]
-#       NEW: Paginates ?page=2,3,... (configurable) and de-dupes across sorts.
+#   - Jams "Starting This Month/Week/In Progress" (paginated)      -> [JAMS]
+#       Paginates ?page=2,3,..., de-dupes across lists & sorts, and
+#       opens each jam page to scan full description for charity terms.
 #
 # Charity-only matching (no "submit" keyword required).
 # Fresh-only filter for BLOG/BOARD items and date-aware pubDate.
@@ -17,17 +18,17 @@ import requests
 from bs4 import BeautifulSoup as BS
 from xml.etree.ElementTree import Element, SubElement, ElementTree
 
-USER_AGENT = "itchio-charity-watcher/1.7"
+USER_AGENT = "itchio-charity-watcher/1.9"
 OUT_FEED = Path("feed.xml")
 STATE = Path(".seen.json")
 
 # --- Settings ----------------------------------------------------------------
 # Non-jam (blog/threads) freshness window:
 MAX_AGE_DAYS = 30
-# How many pages of "starting this month" to crawl per base URL:
-MAX_JAMS_PAGES = 5          # try 5 first; increase if you want deeper crawl
+# How many pages of jam listings to crawl per base URL:
+MAX_JAMS_PAGES = 5          # increase if you want deeper crawl
 MAX_JAMS_PER_PAGE = 60      # safety cap per page
-MAX_JAMS_TOTAL = 200        # overall safety cap per run across both lists
+MAX_JAMS_TOTAL = 400        # overall safety cap per run across all jam lists
 
 # --- Keyword filters (charity only) ------------------------------------------
 CHARITY = re.compile(
@@ -39,11 +40,18 @@ CHARITY = re.compile(
 SOURCES = [
     ("https://itch.io/blog", "[BLOG]"),
     ("https://itch.io/board/533649/game-jams", "[BOARD]"),                    # Game Jams board
-    ("https://itch.io/jams/starting-this-month", "[JAMS]"),                   # Month view
-    ("https://itch.io/jams/starting-this-month/sort-date", "[JAMS]"),         # "Starting Soon" sort
+    # Month views (default + sort-by-date)
+    ("https://itch.io/jams/starting-this-month", "[JAMS]"),
+    ("https://itch.io/jams/starting-this-month/sort-date", "[JAMS]"),
+    # Week views (default + sort-by-date)
+    ("https://itch.io/jams/starting-this-week", "[JAMS]"),
+    ("https://itch.io/jams/starting-this-week/sort-date", "[JAMS]"),
+    # In-progress views (default + sort-by-date)
+    ("https://itch.io/jams/in-progress", "[JAMS]"),
+    ("https://itch.io/jams/in-progress/sort-date", "[JAMS]"),
 ]
 
-# Global de-dupe for jam links across both month views
+# Global de-dupe for jam links across all lists
 JAMS_SEEN_LINKS = set()
 
 # --- HTTP helpers -------------------------------------------------------------
@@ -97,7 +105,8 @@ def within_age(ts, days: int = MAX_AGE_DAYS) -> bool:
     return ts >= now - dt.timedelta(days=days)
 
 # --- Jam listing parsing (exclude 'Ended …' AND follow jam pages) ------------
-JAM_STATUS_HINT = re.compile(r"(Starts in|Submission closes in|Ended)", re.I)
+# Include a few status phrases we might see on cards
+JAM_STATUS_HINT = re.compile(r"(Starts in|Submission closes in|Ends in|Closes in|Ended)", re.I)
 
 def parse_iso(ts: str):
     try:
@@ -178,13 +187,14 @@ def collect_jam_links_from_listing(base_url: str, max_pages: int, per_page_cap: 
 
             starts_in = bool(re.search(r"\bStarts in\b", text_blob, re.I))
             closes_in = bool(re.search(r"\bSubmission closes in\b", text_blob, re.I))
+            ends_in   = bool(re.search(r"\b(Ends in|Closes in)\b", text_blob, re.I))
 
             keep = False
             if ts_val:
-                if (starts_in or closes_in) and ts_val > now:
+                if (starts_in or closes_in or ends_in) and ts_val > now:
                     keep = True
             else:
-                if starts_in or closes_in:
+                if starts_in or closes_in or ends_in:
                     keep = True
 
             if not keep:
@@ -203,8 +213,8 @@ def collect_jam_links_from_listing(base_url: str, max_pages: int, per_page_cap: 
         time.sleep(1)  # polite delay between listing pages
     return collected
 
-def items_from_jams_month(base_url: str, label: str):
-    """Paginate through month listings, then follow each jam page and apply full-body checks."""
+def items_from_jams_list(base_url: str, label: str):
+    """Paginate through listing (month/week/in-progress), then follow each jam page and apply full-body checks."""
     out = []
     kept = collect_jam_links_from_listing(
         base_url, MAX_JAMS_PAGES, MAX_JAMS_PER_PAGE, MAX_JAMS_TOTAL
@@ -233,9 +243,13 @@ def items_from_html(url: str, html: str, label: str):
     soup = BS(html, "html.parser")
     candidates = []
 
-    # Jam listings (starting this month) — now paginated
-    if url.startswith("https://itch.io/jams/starting-this-month"):
-        return items_from_jams_month(url, label)
+    # Jam listings (month/week/in-progress) — paginated + deep jam scan
+    if url.startswith((
+        "https://itch.io/jams/starting-this-month",
+        "https://itch.io/jams/starting-this-week",
+        "https://itch.io/jams/in-progress"
+    )):
+        return items_from_jams_list(url, label)
 
     # Blog index — prefer real blog post links
     if url.rstrip("/") == "https://itch.io/blog":
