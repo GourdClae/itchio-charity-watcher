@@ -1,1 +1,23 @@
+name: Build RSS
+on:
+  schedule:
+    - cron: "0 13 * * *"   # daily at 13:00 UTC (9am US/Eastern)
+  workflow_dispatch: {}
 
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install requests beautifulsoup4
+      - run: python itchio_charity_bundles_feed.py
+      - name: Commit feed
+        run: |
+          git config user.name "rss-bot"
+          git config user.email "rss-bot@example.com"
+          git add feed.xml .seen.json || true
+          git commit -m "Update feed" || true
+          git push
